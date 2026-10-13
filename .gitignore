@@ -82,3 +82,6 @@ scripts/.django-*
 
 #codecov
 llvm-cov-env.sh
+
+# Amp orb portals
+.amp/portals/*

@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Prepares a fresh Amp orb: Rust toolchain, Python venv, gettext, and prebuilt artifacts.
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+step() {
+  local name="$1"
+  shift
+  local start=$SECONDS
+  echo "==> $name"
+  "$@"
+  echo "<== $name ($((SECONDS - start))s)"
+}
+
+install_system_packages() {
+  if ! command -v msgfmt >/dev/null; then
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gettext
+  fi
+}
+
+install_rust() {
+  if [[ ! -x "$HOME/.cargo/bin/rustup" ]]; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+      sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+  fi
+  # Installs the channel and components pinned in rust-toolchain.toml.
+  "$HOME/.cargo/bin/rustup" toolchain install
+}
+
+install_just() {
+  command -v just >/dev/null || uv tool install --quiet rust-just
+}
+
+sync_python() {
+  # CI's sanity job runs on Python 3.13.
+  uv sync --locked --python 3.13
+}
+
+prefetch_crates() {
+  cargo fetch --locked
+}
+
+build_extension() {
+  uv run --no-sync maturin develop
+  (cd tests && uv run --no-sync -m django compilemessages)
+}
+
+build_rust_tests() {
+  PYO3_PYTHON="$repo_root/.venv/bin/python" cargo test --workspace --locked --no-run
+}
+
+# Replaces the text between the begin/end markers so reruns pick up changes.
+write_block() {
+  local file="$1" begin="$2" end="$3" content="$4"
+  mkdir -p "$(dirname "$file")"
+  touch "$file"
+  local kept
+  kept="$(awk -v b="$begin" -v e="$end" '$0 == b {skip = 1} !skip {print} $0 == e {skip = 0}' "$file")"
+  printf '%s\n%s\n%s\n%s\n' "$kept" "$begin" "$content" "$end" >"$file"
+}
+
+configure_shell() {
+  local venv="$repo_root/.venv" python_libdir profile notes
+  python_libdir="$("$venv/bin/python" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+
+  profile="$(
+    cat <<EOF
+case ":\$PATH:" in
+  *":\$HOME/.cargo/bin:"*) ;;
+  *) export PATH="\$HOME/.cargo/bin:\$PATH" ;;
+esac
+case "\$PWD/" in
+  "$repo_root"/*)
+    export VIRTUAL_ENV="$venv"
+    export PYO3_PYTHON="$venv/bin/python"
+    # Rust test binaries link libpython from the uv-managed interpreter.
+    case ":\${LD_LIBRARY_PATH:-}:" in
+      *":$python_libdir:"*) ;;
+      *) export LD_LIBRARY_PATH="$python_libdir\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}" ;;
+    esac
+    case ":\$PATH:" in
+      *":$venv/bin:"*) ;;
+      *) export PATH="$venv/bin:\$PATH" ;;
+    esac
+    ;;
+esac
+EOF
+  )"
+  write_block "$HOME/.bash_profile" \
+    "# >>> django-rusty-templates orb environment >>>" \
+    "# <<< django-rusty-templates orb environment <<<" \
+    "$profile"
+
+  notes="$(
+    cat <<'EOF'
+# django-rusty-templates-agentic orb notes
+
+- Rust (pinned by rust-toolchain.toml), uv, just, and gettext are installed. Login shells started in the repo activate `.venv` (Python 3.13) and set `PYO3_PYTHON` and `LD_LIBRARY_PATH` for it.
+- After changing Rust code, rebuild the extension before running pytest: `maturin develop && pytest` (or `just python-test`).
+- Rust tests embed Python and need the venv's packages on `PYTHONPATH`; run them serially like CI:
+  `PYTHONPATH="$PWD/python:$PWD:$PWD/.venv/lib/python3.13/site-packages" cargo test --workspace -- --test-threads=1`
+- Lint like CI: `ruff check`, `ruff format --check`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`.
+EOF
+  )"
+  write_block "$HOME/.config/amp/AGENTS.md" \
+    "<!-- >>> django-rusty-templates orb notes >>> -->" \
+    "<!-- <<< django-rusty-templates orb notes <<< -->" \
+    "$notes"
+}
+
+export PATH="$HOME/.cargo/bin:$PATH"
+
+step "System packages" install_system_packages
+step "Rust toolchain" install_rust
+step "just" install_just
+step "Python dependencies" sync_python
+step "Crate downloads" prefetch_crates
+step "Extension build" build_extension
+step "Rust test build" build_rust_tests
+step "Shell environment" configure_shell
